@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "hydrocal"
+version = "0.1.0"
+description = "Processing and analysis toolkit for hydration calorimetry (TGA/DSC) data"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Michael L. Whittaker" },
+]
+
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "scipy",
+    "scikit-learn",
+    "scikit-fda",
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter",
+    "ipykernel",
+]
+
+[tool.setuptools.packages.find]
+include = ["utils*"]
