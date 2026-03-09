@@ -1,4 +1,5 @@
 import copy
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.cluster import DBSCAN
@@ -21,9 +22,13 @@ class Preprocess():
     """
     
     #---Preprocess attributes
-    def __init__(self, data_directory, method_directory, extension='csv', delimiter=',') -> None:
+    def __init__(self, base_path, extension='csv', method_extension='txt', delimiter=',') -> None:
+        #--- construct data and method directory paths from base_path
+        data_directory = base_path + 'results/'
+        method_directory = base_path + 'methods/'
+
         #--- define subclasses
-        loaded = Data(data_directory, method_directory, extension=extension, delimiter=delimiter)
+        loaded = Data(data_directory, method_directory, extension=extension, method_extension=method_extension, delimiter=delimiter)
 
         #--- initialize subclass attributes
         loaded.parse_method()
@@ -40,6 +45,29 @@ class Preprocess():
         self.pca      = dict({})
         self.fftpca   = dict({})
         self.fpca     = dict({})
+        
+        #--- determine number of experiments for each loaded file
+        self.num_experiments = dict({})
+        for data_file in self.metadata.get('file_names', []):
+            data_name = os.path.basename(data_file)
+            data_name = os.path.splitext(data_name)[0]
+            try:
+                num_exp = self.get_num_experiments(data_name)
+                self.num_experiments[data_name] = num_exp
+            except (IndexError, ValueError, TypeError) as e:
+                print(f"Warning: Could not determine number of experiments for '{data_name}': {e}")
+                print(f"  Headers: {self.metadata.get(f'{data_name}_headers', 'N/A')}")
+                self.num_experiments[data_name] = None
+
+        #--- method-to-experiment assignments {data_name: [method_name_exp0, method_name_exp1, ...]}
+        self.method_assignments = {}
+        for data_file in self.metadata.get('file_names', []):
+            data_name = os.path.splitext(os.path.basename(data_file))[0]
+            if self.num_experiments.get(data_name):
+                try:
+                    self.assign_methods(data_name)
+                except Exception as e:
+                    print(f"Warning: Could not assign methods for '{data_name}': {e}")
 
         #--- standard colors for data channels
         self.colors = ['0.1', 'k', 'r', 'b']
@@ -57,36 +85,337 @@ class Preprocess():
         return norm, delta, min, max
     
     
-    def data_select(self, name, headers=['Weight', 'Ts', 'HF', 'RH']):
-        """ select data of interest
-        """        
-        header_indices = np.arange(0, len(self.metadata[f'{name}_headers']), dtype=int)
-        column_indices = dict(zip(self.metadata[f'{name}_headers'], header_indices))
-        key_headers    = headers
-        unit_indices   = [column_indices[h] for h in key_headers]
-        key_units      = [self.metadata[f'{name}_units'][i] for i in unit_indices]
+    def get_num_experiments(self, filename):
+        """ Automatically determine the number of experiments in a results file
+            by counting duplicate column headers.
+            
+            Assumes the first column is time [s], followed by n repetitions of each 
+            measured variable for n experiments (e.g., Weight, Ts, HF, RH repeated n times).
+            
+            Arguments:
+                filename (str): name of the results file (without extension)
+            
+            Returns:
+                num_experiments (int): number of experiments contained in the file
+                
+            Raises:
+                IndexError: if headers are missing or malformed
+                ValueError: if column structure doesn't match expected pattern
+        """
+        # Get the headers from metadata
+        headers = self.metadata.get(f'{filename}_headers', None)
+        
+        if headers is None:
+            raise IndexError(f"No headers found for file '{filename}'")
+        
+        if len(headers) < 2:
+            raise ValueError(f"Expected at least 2 columns (time + measurement), got {len(headers)}")
+        
+        # Skip the first column (time) and find the first measurement column
+        try:
+            first_measurement_header = headers[1]
+        except IndexError:
+            raise IndexError(f"Missing first measurement header in '{filename}'")
+        
+        # Count occurrences of the first measurement header
+        num_experiments = np.sum(headers == first_measurement_header)
+        
+        if num_experiments == 0:
+            raise ValueError(f"Could not find any matching headers for '{first_measurement_header}' in '{filename}'")
+        
+        return int(num_experiments)
+    
+    
+    def data_select(self, name, headers=None):
+        """ select data of interest.
+
+        If headers is None, auto-detect unique non-time headers from the file.
+        """
+        all_headers = self.metadata[f'{name}_headers']
+        header_indices = np.arange(0, len(all_headers), dtype=int)
+        column_indices = dict(zip(all_headers, header_indices))
+
+        if headers is None:
+            # Auto-detect: unique headers, skip the first (time) column and empty strings
+            seen = set()
+            headers = []
+            for h in all_headers[1:]:
+                if h and h not in seen:
+                    seen.add(h)
+                    headers.append(h)
+
+        key_headers = headers
+        unit_indices = [column_indices[h] for h in key_headers]
+        key_units = [self.metadata[f'{name}_units'][i] for i in unit_indices]
 
         return column_indices, key_headers, key_units
     
     
-    def data_view(self, name, save=False, save_path=''):
-        """ `data_view` displays key data
+    def _get_experiment_columns(self, name, header):
+        """Return all column indices matching a given header for a data file.
+
+        When a file contains multiple experiments, measurement headers (e.g., 'Weight')
+        repeat once per experiment. This returns all matching indices.
         """
-        #--- define data of interest        
-        column_indices, key_headers, key_units = self.data_select(name)
+        headers = self.metadata[f'{name}_headers']
+        return [i for i, h in enumerate(headers) if h == header]
 
-        _, axs = plt.subplots(4, 1, figsize=(30,10))
-        for (ax, h, u, c) in zip(axs, key_headers, key_units, self.colors):
-            
-            ax.plot(self.data[name][column_indices['t']], self.data[name][column_indices[h]], color=c, lw=0.4)
-            ax.set_xlabel('t [s]')
-            ax.set_ylabel(h+f' {u}')
-            
-        plt.tight_layout()
-        plt.show
+    def assign_methods(self, name, duration_tol=0.02):
+        """Assign a method to each experiment in a results file.
 
-        if save:
-            plt.savefig(save_path)
+        Matching is performed in three tiebreaking stages:
+            1. Total duration — the method whose total duration (sum of segment
+               durations, in seconds) is closest to the experiment's measured
+               duration.  Methods within *duration_tol* (fractional) of each
+               other are considered tied.
+            2. Temperature profile similarity — among duration-tied methods,
+               pick the one whose expected temperature profile has the smallest
+               mean-squared error relative to the measured temperature.
+            3. Relative humidity profile similarity — break remaining ties with
+               MSE of the RH profile.
+
+        If a unique assignment still cannot be made for an experiment, the user
+        is prompted to choose from the remaining candidates.
+
+        Arguments:
+            name (str): data file name (without extension), e.g. 'MW2_123'
+            duration_tol (float): fractional tolerance for duration matching
+                (default 0.02, i.e. 2 %).
+
+        Stores result in ``self.method_assignments[name]`` — a list of method
+        names, one per experiment, in experiment order.
+        """
+        method_names = self.metadata.get('method_file_names', [])
+        if not method_names:
+            raise ValueError("No methods loaded. Ensure method files exist in the methods directory.")
+
+        num_exp = self.num_experiments.get(name)
+        if num_exp is None or num_exp == 0:
+            raise ValueError(f"No experiments detected in '{name}'.")
+
+        time_data = self.data[name][0]  # shared time column
+
+        # --- locate per-experiment Temperature and RH column indices ----------
+        temp_cols = self._get_experiment_columns(name, 'Temperature')
+        rh_cols = self._get_experiment_columns(name, 'RH')
+
+        # --- compute each experiment's measured duration -----------------------
+        exp_durations = []
+        for j in range(num_exp):
+            # Use temperature column to find last valid (non-NaN) sample
+            if j < len(temp_cols):
+                col = self.data[name][temp_cols[j]]
+            else:
+                # fallback: use first measurement column for this experiment
+                col = self.data[name][1 + j]
+            valid_mask = ~np.isnan(col)
+            if valid_mask.any():
+                last_valid_idx = np.where(valid_mask)[0][-1]
+                exp_durations.append(time_data[last_valid_idx])
+            else:
+                exp_durations.append(0.0)
+
+        # --- compute total duration of each method (in seconds) ---------------
+        method_durations = {}
+        for m in method_names:
+            method_durations[m] = sum(self.metadata[m]['duration'])
+
+        # --- assign methods experiment-by-experiment --------------------------
+        assignments = []
+        for j in range(num_exp):
+            exp_dur = exp_durations[j]
+
+            # Stage 1: duration matching
+            dur_errors = {m: abs(method_durations[m] - exp_dur) for m in method_names}
+            best_dur_err = min(dur_errors.values())
+            # Tie threshold: within duration_tol of the experiment duration (or 1 s minimum)
+            threshold = max(exp_dur * duration_tol, 1.0)
+            candidates = [m for m, e in dur_errors.items() if e <= best_dur_err + threshold]
+
+            if len(candidates) == 1:
+                assignments.append(candidates[0])
+                continue
+
+            # Stage 2: temperature profile similarity
+            if j < len(temp_cols):
+                exp_temp = self.data[name][temp_cols[j]]
+                temp_mse = {}
+                for m in candidates:
+                    method_temp = self.metadata[m]['temperature_profile']
+                    n = min(len(method_temp), len(exp_temp))
+                    # Only compare over the valid (non-NaN) portion
+                    valid = ~np.isnan(exp_temp[:n])
+                    if valid.any():
+                        temp_mse[m] = np.mean((method_temp[:n][valid] - exp_temp[:n][valid]) ** 2)
+                    else:
+                        temp_mse[m] = np.inf
+
+                best_temp_mse = min(temp_mse.values())
+                # Keep candidates within 1 % of the best MSE (or exactly zero)
+                if best_temp_mse == 0:
+                    candidates = [m for m in candidates if temp_mse[m] == 0]
+                else:
+                    candidates = [m for m in candidates if temp_mse[m] <= best_temp_mse * 1.01]
+
+            if len(candidates) == 1:
+                assignments.append(candidates[0])
+                continue
+
+            # Stage 3: RH profile similarity
+            if j < len(rh_cols):
+                exp_rh = self.data[name][rh_cols[j]]
+                rh_mse = {}
+                for m in candidates:
+                    method_rh = self.metadata[m]['rh_profile']
+                    n = min(len(method_rh), len(exp_rh))
+                    valid = ~np.isnan(exp_rh[:n])
+                    if valid.any():
+                        rh_mse[m] = np.mean((method_rh[:n][valid] - exp_rh[:n][valid]) ** 2)
+                    else:
+                        rh_mse[m] = np.inf
+
+                best_rh_mse = min(rh_mse.values())
+                if best_rh_mse == 0:
+                    candidates = [m for m in candidates if rh_mse[m] == 0]
+                else:
+                    candidates = [m for m in candidates if rh_mse[m] <= best_rh_mse * 1.01]
+
+            if len(candidates) == 1:
+                assignments.append(candidates[0])
+                continue
+
+            # Stage 4: prompt user — could not resolve automatically
+            print(f"\nExperiment {j+1} in '{name}' (duration {exp_dur:.0f} s) "
+                  f"could not be uniquely matched.")
+            print(f"  Remaining candidates: {candidates}")
+            for k, m in enumerate(candidates):
+                print(f"    [{k}] {m}  (duration {method_durations[m]:.0f} s)")
+            while True:
+                choice = input(f"  Select method index for experiment {j+1} [0-{len(candidates)-1}]: ")
+                try:
+                    idx = int(choice)
+                    if 0 <= idx < len(candidates):
+                        break
+                except ValueError:
+                    pass
+                print(f"  Invalid choice. Enter 0-{len(candidates)-1}.")
+            assignments.append(candidates[idx])
+
+        self.method_assignments[name] = assignments
+
+        # Print summary
+        print(f"\nMethod assignments for '{name}':")
+        for j, m in enumerate(assignments):
+            print(f"  Experiment {j+1} -> {m}  "
+                  f"(exp duration: {exp_durations[j]:.0f} s, "
+                  f"method duration: {method_durations[m]:.0f} s)")
+
+        return assignments
+
+    def _resolve_experiment_index(self, data_name, experiment):
+        """Resolve an experiment identifier to a 0-based experiment index.
+
+        Arguments:
+            data_name (str): data file name (without extension)
+            experiment: int (0-based index) or str (method name)
+
+        Returns:
+            int: 0-based experiment index
+        """
+        num_exp = self.num_experiments.get(data_name, 1) or 1
+        if isinstance(experiment, int):
+            if experiment < 0 or experiment >= num_exp:
+                raise IndexError(
+                    f"Experiment index {experiment} out of range for '{data_name}' "
+                    f"(has {num_exp} experiments, use 0-{num_exp - 1}).")
+            return experiment
+        elif isinstance(experiment, str):
+            assignments = self.method_assignments.get(data_name)
+            if assignments is None:
+                raise ValueError(
+                    f"No method assignments for '{data_name}'. "
+                    f"Run assign_methods('{data_name}') first or use an integer index.")
+            matches = [i for i, m in enumerate(assignments) if m == experiment]
+            if len(matches) == 0:
+                raise ValueError(
+                    f"Method '{experiment}' not assigned to any experiment in '{data_name}'. "
+                    f"Assignments: {assignments}")
+            if len(matches) > 1:
+                raise ValueError(
+                    f"Method '{experiment}' is assigned to multiple experiments in "
+                    f"'{data_name}' (indices {matches}). Use an integer index instead.")
+            return matches[0]
+        else:
+            raise TypeError(f"experiment must be int or str, got {type(experiment).__name__}")
+
+    def data_view(self, name=None, experiment=None, save=False, save_path=''):
+        """ `data_view` displays key data for one, some, or all experiments.
+
+        Arguments:
+            name: str, list of str, or None
+                - None: plot all data files
+                - str:  plot a single data file
+                - list: plot the specified data files
+            experiment: int, str, or None
+                - None: plot all experiments (overlay)
+                - int:  plot a single experiment by 0-based index
+                - str:  plot the experiment assigned to this method name
+                        (must be unique — raises ValueError if ambiguous)
+            save (bool): save figure to disk
+            save_path (str): path for saved figure
+        """
+        #--- resolve which data files to plot
+        if name is None:
+            names = [os.path.splitext(os.path.basename(f))[0]
+                     for f in self.metadata.get('file_names', [])]
+        elif isinstance(name, str):
+            names = [name]
+        else:
+            names = list(name)
+
+        for data_name in names:
+            _, key_headers, key_units = self.data_select(data_name)
+            num_exp = self.num_experiments.get(data_name, 1) or 1
+
+            # Resolve which experiments to plot
+            if experiment is not None:
+                exp_idx = self._resolve_experiment_index(data_name, experiment)
+                exp_indices = [exp_idx]
+                title_suffix = f' — exp {exp_idx}'
+                if isinstance(experiment, str):
+                    title_suffix += f' ({experiment})'
+            else:
+                exp_indices = list(range(num_exp))
+                title_suffix = ''
+
+            n_channels = len(key_headers)
+            fig, axs = plt.subplots(n_channels, 1, figsize=(30, 10))
+            if n_channels == 1:
+                axs = [axs]
+            fig.suptitle(data_name + title_suffix, fontsize=16)
+
+            t_idx = 0  # time is always the first column
+
+            for ax, h, u, c in zip(axs, key_headers, key_units, self.colors):
+                col_indices = self._get_experiment_columns(data_name, h)
+                for j in exp_indices:
+                    if j < len(col_indices):
+                        ci = col_indices[j]
+                        label = f'exp {j}' if len(exp_indices) > 1 else None
+                        ax.plot(self.data[data_name][t_idx],
+                                self.data[data_name][ci],
+                                color=c, lw=0.4, alpha=0.7, label=label)
+                ax.set_xlabel('t [s]')
+                ax.set_ylabel(h + f' {u}')
+                if len(exp_indices) > 1:
+                    ax.legend(fontsize=8, loc='upper right')
+
+            plt.tight_layout()
+            plt.show()
+
+            if save:
+                path = save_path if len(names) == 1 else f'{save_path}_{data_name}.png'
+                fig.savefig(path)
     
     
     def data_stats(self, name, method_name=None):
@@ -190,7 +519,7 @@ class Preprocess():
             gradient[-w:] = 0
             self.gradient[name].update({h+'_gradient': gradient}) # save gradients to dictionary
             
-            ax.plot(self.data[name][column_indices['t']], gradient,color=c, lw=0.1)
+            ax.plot(self.data[name][0], gradient,color=c, lw=0.1)
             ax.set_xlabel('t [s]')
             ax.set_ylabel(r'$\partial$'+h+r'/$\partial$t '+u)
             
@@ -737,7 +1066,7 @@ class Preprocess():
             ifft_phase_shift = np.abs(ifft_phase[:fft_frequency_length])
             smoothed_iphase_shift = np.abs(smoothed_iphase[:fft_frequency_length])
 
-            time = self.data[name][column_indices['t']]
+            time = self.data[name][0]
             #--- plot ffts
             ax0, ax1 = ax
             ax0.plot(fft_frequency[1:fft_frequency_length], np.log(fft_power_shift[1:]), color=c, lw=0.05)
